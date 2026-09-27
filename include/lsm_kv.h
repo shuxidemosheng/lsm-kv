@@ -40,6 +40,10 @@ public:
     // 查询。true = 存在且未被删除（*value 有效）
     bool Get(const std::string& key, std::string* value);
 
+    // 范围扫描 [begin, end)：按 key 升序返回所有"存活"的记录。
+    // 实现与 compaction 同源：k 路归并 + 最新版本获胜 + 墓碑过滤。
+    std::vector<Entry> Scan(const std::string& begin, const std::string& end);
+
     // 主动把 MemTable 落盘（Close 前调用可实现优雅关闭）
     void Flush();
 

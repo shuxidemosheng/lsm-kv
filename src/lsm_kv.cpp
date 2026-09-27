@@ -191,6 +191,52 @@ bool LsmKV::Get(const std::string& key, std::string* value) {
     return false;
 }
 
+// 范围扫描：与 compaction 相同的归并框架，只是输出"存活记录"而不是写文件。
+// 数据源（新→旧）：MemTable、L0 各文件、L1。
+std::vector<Entry> LsmKV::Scan(const std::string& begin, const std::string& end) {
+    // 1. 把每个源在 [begin,end) 内的数据收集成有序向量
+    //    （跳表/迭代器顺序读，天然有序）
+    std::vector<std::vector<Entry>> sources;
+    {
+        std::vector<Entry> mem;
+        memtable_.ForEach([&](const Entry& e) {
+            if (e.key >= begin && e.key < end) mem.push_back(e);
+        });
+        if (!mem.empty()) sources.push_back(std::move(mem));
+        auto collect = [&](SST* s) {
+            std::vector<Entry> v;
+            for (auto it = s->NewIter(); it.Valid(); it.Next()) {
+                const Entry& e = it.entry();
+                if (e.key >= end) break;             // SST 有序：可以提前停
+                if (e.key >= begin) v.push_back(e);
+            }
+            if (!v.empty()) sources.push_back(std::move(v));
+        };
+        for (SST* s : l0_) collect(s);               // 新→旧
+        if (l1_) collect(l1_);
+    }
+
+    // 2. 归并：最小 key 最先出现（最新）的版本获胜，墓碑丢弃
+    std::vector<size_t> pos(sources.size(), 0);
+    std::vector<Entry> out;
+    for (;;) {
+        int best = -1;
+        for (size_t i = 0; i < sources.size(); ++i) {
+            if (pos[i] >= sources[i].size()) continue;
+            if (best < 0 || sources[i][pos[i]].key < sources[best][pos[best]].key)
+                best = static_cast<int>(i);
+        }
+        if (best < 0) break;
+        std::string key = sources[best][pos[best]].key;
+        Entry e = sources[best][pos[best]];
+        for (size_t i = 0; i < sources.size(); ++i)  // 跳过同 key 的老版本
+            if (pos[i] < sources[i].size() && sources[i][pos[i]].key == key)
+                ++pos[i];
+        if (!e.tombstone) out.push_back(std::move(e));
+    }
+    return out;
+}
+
 bool LsmKV::FlushLocked() {
     if (memtable_size_ == 0) return true;
     char name[64];
