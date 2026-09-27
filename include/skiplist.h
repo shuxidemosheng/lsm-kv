@@ -40,6 +40,9 @@ public:
     //   更老层的 SST 里即使有也不能再看——这是 LSM 读路径的关键规则）
     bool Get(const std::string& key, std::string* value, bool* tombstone) const;
 
+    // 清空所有记录（flush 后重置 MemTable 用）
+    void Clear();
+
     // 近似内存占用（字节）。MemTable 用它决定何时 flush 成 SST。
     // "近似"即可：精确记账得不偿失，LevelDB 也只记近似值。
     size_t ApproximateSize() const { return size_bytes_; }

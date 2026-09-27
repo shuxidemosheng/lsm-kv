@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "bloom.h"
 #include "skiplist.h"
 
 namespace lsm {
@@ -58,6 +59,7 @@ private:
     uint64_t num_entries_ = 0;
     uint64_t bytes_since_index_ = 0;   // 距上个索引点累计的数据量
     std::vector<IndexEntry> index_;
+    std::vector<std::string> keys_;    // 暂存全部 key，Finish 时构建布隆
     bool finished_ = false;
 };
 
@@ -70,6 +72,7 @@ public:
     ~SST();
 
     // 点查。key 不在本文件 → false；在 → true（*tombstone 区分删除标记）
+    // 先过布隆过滤器：不存在的 key 绝大多数在这里被拦下（阶段 2）
     bool Get(const std::string& key, std::string* value, bool* tombstone) const;
 
     // 顺序遍历 data 区（k 路归并的输入）
@@ -105,6 +108,8 @@ private:
     uint64_t index_offset_ = 0;
     uint64_t bloom_offset_ = 0;  // 阶段 2 启用
     uint32_t bloom_len_ = 0;
+    BloomFilter bloom_;          // 从 bloom 区反序列化；空 = 未启用
+    bool has_bloom_ = false;
     std::vector<IndexEntry> index_;
     std::string smallest_;   // = 第一个索引点的 key（快速排除用）
 };

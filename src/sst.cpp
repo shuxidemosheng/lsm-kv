@@ -64,6 +64,7 @@ void SSTBuilder::Add(const Entry& e) {
         index_.push_back({e.key, offset_});
         bytes_since_index_ = 0;
     }
+    keys_.push_back(e.key);        // 布隆过滤器的原料（Finish 时统一构建）
     WriteRecord(e);
     offset_ += 9 + e.key.size() + e.value.size();  // 1+4+4+klen+vlen
     bytes_since_index_ += 9 + e.key.size() + e.value.size();
@@ -71,9 +72,24 @@ void SSTBuilder::Add(const Entry& e) {
 }
 
 void SSTBuilder::Finish() {
+    uint64_t bloom_offset = offset_;
+
+    // 1. 布隆过滤区（预期元素数 = 实际 key 数，目标误判率 1%）
+    std::string bloom;
+    uint32_t bloom_len = 0;
+    if (!keys_.empty()) {
+        BloomFilter bf(keys_.size(), 0.01);
+        for (const auto& k : keys_) bf.Add(k);
+        bloom = bf.Serialize();
+        bloom_len = static_cast<uint32_t>(bloom.size());
+        ssize_t nb = write(fd_, bloom.data(), bloom.size());
+        (void)nb;
+        offset_ += bloom.size();
+    }
+
     uint64_t index_offset = offset_;
 
-    // 1. 稀疏索引区
+    // 2. 稀疏索引区
     std::string idx;
     for (const auto& ie : index_) {
         AppendU32(&idx, static_cast<uint32_t>(ie.key.size()));
@@ -83,15 +99,15 @@ void SSTBuilder::Finish() {
     ssize_t n = write(fd_, idx.data(), idx.size());
     (void)n;
 
-    // 2. footer（固定 40 字节）
+    // 3. footer（固定 40 字节）
     std::string ft;
     ft.append(kMagic, 4);
     AppendU32(&ft, kSstVersion);
     AppendU64(&ft, num_entries_);
     AppendU64(&ft, index_offset);
     AppendU32(&ft, static_cast<uint32_t>(index_.size()));
-    AppendU64(&ft, 0);          // bloom_offset：阶段 2 启用
-    AppendU32(&ft, 0);          // bloom_len
+    AppendU64(&ft, bloom_offset);
+    AppendU32(&ft, bloom_len);
     n = write(fd_, ft.data(), ft.size());
     (void)n;
 
@@ -146,7 +162,17 @@ SST* SST::Open(const std::string& path) {
     sst->data_end_ = sst->index_offset_;
     (void)version;
 
-    // 2. 读整个稀疏索引进内存（每 4KB 数据一条，内存开销可忽略）
+    // 3. 读布隆过滤区（存在且合法时启用；旧格式/无布隆则跳过）
+    if (sst->bloom_len_ > 0 && sst->bloom_offset_ + sst->bloom_len_
+        <= sst->index_offset_) {
+        std::string bbuf(sst->bloom_len_, 0);
+        if (sst->ReadExact(sst->bloom_offset_, bbuf.data(), bbuf.size())) {
+            sst->bloom_ = BloomFilter::Deserialize(bbuf);
+            sst->has_bloom_ = sst->bloom_.num_bits() > 0;
+        }
+    }
+
+    // 4. 读整个稀疏索引进内存（每 4KB 数据一条，内存开销可忽略）
     //    索引区长度 = 文件尾 - footer - index_offset
     std::string ibuf(static_cast<size_t>(st.st_size - kSstFooterSize - sst->index_offset_), 0);
     if (!sst->ReadExact(sst->index_offset_, ibuf.data(), ibuf.size())) {
@@ -190,6 +216,10 @@ bool SST::ParseRecord(uint64_t off, Entry* e, uint64_t* next_off) const {
 }
 
 bool SST::Get(const std::string& key, std::string* value, bool* tombstone) const {
+    // 第一道闸门：布隆过滤器说"一定不存在"，直接返回
+    // （布隆只会误判"存在"，绝不会漏判"不存在"——方向性是它安全性的关键）
+    if (has_bloom_ && !bloom_.MayContain(key)) return false;
+
     // 快速排除：key 小于文件最小 key（= 第一个索引点），必然不存在
     if (index_.empty() || key < index_.front().key)
         return false;

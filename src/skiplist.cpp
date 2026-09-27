@@ -24,6 +24,18 @@ SkipList::~SkipList() {
     }
 }
 
+void SkipList::Clear() {
+    Node* p = head_->next[0];
+    while (p) {
+        Node* nxt = p->next[0];
+        delete p;
+        p = nxt;
+    }
+    for (int i = 0; i < kMaxLevel; ++i) head_->next[i] = nullptr;
+    level_ = 1;
+    size_bytes_ = 0;
+}
+
 int SkipList::RandomLevel() {
     // 每层以 1/kBranch 的概率继续升高。用 <random> 而不是 rand()：
     // 线程安全性无所谓（MemTable 单线程写），但分布质量要稳定。
