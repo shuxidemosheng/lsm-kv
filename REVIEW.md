@@ -99,6 +99,6 @@ make bench                          # 关键数字：miss get 787万/s、fsync 2
 
 ## 八、档案
 
-- GitHub：https://github.com/shuxidemosheng/lsm-kv（若推送）/ 本地 `~/lsm-kv`
-- 归档：`D:\AIcoding\lsmkv-backup.tar.gz`（见打包说明）
-- 配套项目：`~/mydocker`（容器）、`~/TinyWebServer`（网络）
+- **GitHub：https://github.com/shuxidemosheng/lsm-kv**（公开，按阶段提交 + tag v0.1）
+- 归档：`D:\AIcoding\lsmkv-backup.tar.gz`
+- 配套项目：`~/mydocker`（容器，GitHub 同名仓库）、`~/TinyWebServer`（网络）
