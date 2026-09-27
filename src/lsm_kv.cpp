@@ -106,14 +106,14 @@ bool LsmKV::LoadDir(std::string* err) {
     }
     struct dirent* e;
     std::vector<std::pair<uint64_t, std::string>> l0names;
-    std::pair<uint64_t, std::string> l1name{0, ""};
+    std::vector<std::pair<uint64_t, std::string>> l1names;   // L1 可能有多个（崩溃残留）
     while ((e = readdir(d)) != nullptr) {
         int lvl;
         uint64_t id;
         if (!ParseSstName(e->d_name, &lvl, &id)) continue;
         next_file_id_ = std::max(next_file_id_, id + 1);
         if (lvl == 0) l0names.push_back({id, e->d_name});
-        else if (id > l1name.first) l1name = {id, e->d_name};   // L1 只取最大 id
+        else l1names.push_back({id, e->d_name});
     }
     closedir(d);
 
@@ -124,7 +124,14 @@ bool LsmKV::LoadDir(std::string* err) {
         SST* s = SST::Open(opts_.dir + "/" + name);
         if (s) l0_.push_back(s);
     }
-    if (!l1name.second.empty()) l1_ = SST::Open(opts_.dir + "/" + l1name.second);
+    // L1 可能有多个（compaction 中途崩溃的残留），从新到旧挑第一个能打开的；
+    // 打不开的（半个文件）忽略——它的内容还没生效，旧 L1 兜底
+    std::sort(l1names.begin(), l1names.end(),
+              [](auto& a, auto& b) { return a.first > b.first; });
+    for (auto& [id, name] : l1names) {
+        l1_ = SST::Open(opts_.dir + "/" + name);
+        if (l1_) { next_file_id_ = std::max(next_file_id_, id + 1); break; }
+    }
     return true;
 }
 
@@ -211,7 +218,74 @@ bool LsmKV::FlushLocked() {
     return true;
 }
 
-// 阶段 3 实现：k 路归并 L0(+L1) → 新 L1
-bool LsmKV::CompactLocked() { return true; }
+// 阶段 3：k 路归并 L0(+L1) → 新 L1
+//
+// 归并规则：
+//   - 各输入文件内部 key 有序且唯一；文件间可能同 key；
+//   - 输入按"新→旧"排列，同 key 时取最先出现的（最新版本），
+//     其余版本跳过；
+//   - 输出目标是**底层**（L1 之下没有更老的数据），所以墓碑可以
+//     物理删除——这正是"删除被推迟到 compaction"的兑现处。
+bool LsmKV::CompactLocked() {
+    std::vector<SST*> inputs = l0_;          // 已按新→旧排列
+    if (l1_) inputs.push_back(l1_);          // L1 最老，排最后
+
+    std::vector<SST::Iter> iters;
+    iters.reserve(inputs.size());
+    for (SST* s : inputs) iters.push_back(s->NewIter());
+
+    char name[64];
+    snprintf(name, sizeof(name), "l1-%08llu.sst",
+             static_cast<unsigned long long>(next_file_id_));
+    std::string newpath = opts_.dir + "/" + name;
+
+    SSTBuilder b(newpath);
+    size_t kept = 0, dropped_tomb = 0, dropped_dup = 0;
+    for (;;) {
+        // 在所有有效迭代器里找最小 key（输入少，线性扫足够）
+        int best = -1;
+        for (size_t i = 0; i < iters.size(); ++i) {
+            if (!iters[i].Valid()) continue;
+            if (best < 0 || iters[i].entry().key < iters[best].entry().key)
+                best = static_cast<int>(i);
+        }
+        if (best < 0) break;                 // 全部耗尽
+        std::string key = iters[best].entry().key;
+        Entry e = iters[best].entry();       // 最新版本（同 key 中最先出现）
+
+        // 所有持有该 key 的迭代器都前进（同 key 的老版本被覆盖/删除）
+        for (auto& it : iters)
+            if (it.Valid() && it.entry().key == key) it.Next();
+
+        if (e.tombstone) {
+            ++dropped_tomb;                  // 底层之下无更老数据 → 墓碑可弃
+        } else {
+            b.Add(e);
+            ++kept;
+        }
+    }
+    b.Finish();
+
+    // 删除旧输入文件，切换到新 L1
+    std::vector<std::string> oldpaths;
+    for (SST* s : l0_) {
+        oldpaths.push_back(s->path());
+        delete s;
+    }
+    l0_.clear();
+    if (l1_) {
+        oldpaths.push_back(l1_->path());
+        delete l1_;
+        l1_ = nullptr;
+    }
+    l1_ = SST::Open(newpath);
+    if (!l1_) return false;
+    ++next_file_id_;
+    for (const auto& p : oldpaths) remove(p.c_str());   // cstdio::remove
+
+    fprintf(stderr, "[compact] kept=%zu drop_tomb=%zu drop_dup=%zu -> %s\n",
+            kept, dropped_tomb, dropped_dup, name);
+    return true;
+}
 
 }  // namespace lsm
